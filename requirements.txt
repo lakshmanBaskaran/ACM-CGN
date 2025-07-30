@@ -1,0 +1,19 @@
+#Core ML & Data Handling
+numpy
+torch
+torchaudio
+h5py
+PyYAML
+scikit-learn
+scipy
+
+#GNN & Vision Models
+torch-geometric
+timm
+
+#Signal Processing & Wavelets
+kymatio
+PyWavelets
+
+Utilities
+tqdm
