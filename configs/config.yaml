@@ -1,162 +1,131 @@
 # SPDX-License-Identifier: MIT
 
 data:
-  raw_path: "/workspace/data/raw/GOLD_XYZ_OSC.0001_1024.hdf5"
+  raw_path:      "data/raw/GOLD_XYZ_OSC.0001_1024.hdf5"
   processed_dir: "data/processed"
 
 preprocess:
-  train_ratio: 0.8
-  random_seed: 42
-  shard_size: 50000
-  cpu_workers: 12
+  train_ratio:  0.8
+  random_seed:  42
+  shard_size:   50000
+
   spectrogram:
-    n_fft: 128
+    n_fft:      256
     hop_length: 64
-    window: hann
+    window:     hann
+
   cwt:
-    scales: [1, 2, 4, 8, 16, 32]
+    scales: [1,2,3,4,6,8,12,16,24,32]
+
   dwt:
     wavelet: db4
-    level: 4
-  dsp:
-    bandpass:
-      enabled: true
-      low: 0.1
-      high: 0.45
-      fs: 1.0
-      order: 4
-    wiener:
-      enabled: true
-      mysize: 7
-    matched:
-      enabled: false
-      pulse_shape: [ ]
+    level:   4
+
   denoise:
-    wavelet: db4
-    level: 4
+    wavelet:      db4
+    level:        4
     threshold_db: 0
-  hoc:
-    enabled: true
-    orders: [20, 21, 40, 41, 42, 63]
-    normalize: true
-  scd:
-    enabled: true
-    n_fft: 256
-    alphas: [0.1, 0.2, 0.25]
-    take_abs: true
-  wpt:
-    enabled: true
-    wavelet: db4
-    level: 3
-    agg: energy
-  bispec:
-    enabled: false
-    n_fft: 256
-    downsample: 4
-    take_abs: true
+
   save_dtype:
-    tm: float32
+    tm:   float32
     spec: float32
-    cwt: float32
-    dwt: float32
-    segfeat: float32
-    hoc: float32
-    scd: float32
-    wpt: float32
-    bispec: float32
-    scat: float32
-    eng: float32
+    cwt:  float32
+    dwt:  float32
 
 segmentation:
-  segment_len: 128
-  overlap: 0.50
+  segment_len:  128
+  overlap:      0.50
   num_segments: 15
 
 augmentation:
-  sigaugment_enabled: true
-  time_shift_prob: 0.2
-  phase_rotate_prob: 0.2
-  freq_shift_prob: 0.2
-  freq_shift_max: 0.1
-  noise_prob: 0.2
-  noise_std_max: 0.1
-  mixup_alpha: 0.5
+  time_shift_prob:   0.45
+  phase_rotate_prob: 0.35
+  noise_prob:        0.12
+  noise_std_max:     0.06
+  mixup_alpha:       0.4
   spec_augment:
-    time_mask_prob: 0.1
-    freq_mask_prob: 0.1
-
-# ACCURACY FIX: New section to control dataset filtering
-dataset:
-  min_snr_db: 2       # Only train on signals with SNR of 2 dB or higher
-  classes_to_exclude: [6, 14, 15] # Exclude the most confusing classes
+    time_mask_prob:  0.25
+    freq_mask_prob:  0.25
 
 model:
+  use_sag_pool: true
+  graph_connectivity: full          # ↑ accuracy (slower than 'chain')
+  gnn_impl: gatv2
   input_channels: 4
-  seg_feat_dim: 64
-  eng_feat_dim: 17
-  tf_heads: 4
-  gnn_hidden_dim: 128
-  gnn_heads: 8
-  gnn_layers: 6
-  dropout: 0.20
-  # ACCURACY FIX: Update number of classes after excluding some
-  num_classes: 21 # (24 total - 3 excluded)
-  snr_split_db: 5.0
+  seg_feat_dim:   192              # ↑ capacity for segment encoder
+  gnn_hidden_dim: 384              # ↑ backbone width
+  gnn_heads:      4
+  gnn_layers:     8                # deeper GNN
+  sag_pool_ratio: 0.5
+  dropout:        0.15
+  num_classes:    24
+  snr_split_db:   10.0
+  use_experts:
+    psk: true
+    qam: true
+    fsk: true
 
 training:
-  skip_ae_pretrain: true
-  ae_ckpt: "checkpoints/ae.pth"
-  device: cuda
-  batch_size: 768
-  test_batch_size: 1024
-  num_workers: 8
-  prefetch_factor: 8
-  epochs: 60
-  lr: 2e-4
-  weight_decay: 1e-4
-  focal_gamma: 1.0
-  label_smoothing: 0.05
-  grad_clip_norm: 2.0
-  recon_loss_weight: 0.1
+  use_autoenc:   true
+  use_compile:   true              # compile encoders/head; PyG kept eager by model wrapper
+  compile_mode:  reduce-overhead
+  compile_pyg:   false             # set true only if PyG >= 2.5
+  channels_last: true
+  adamw_fused:   false
+  device:        cuda
+
+  batch_size:        4096
+  micro_batch_size:  1024
+  test_batch_size:   4096
+
+  num_workers:       8
+  prefetch_factor:   6
+  epochs:            50            # a bit longer to fit deeper model
+
+  max_samples_per_epoch: 0
+  val_max_batches:       200
+
+  # Optimizer & scheduler (OneCycle generally converges stronger here)
+  lr:             2e-4             # base LR (unused by OneCycle's max_lr but kept for safety)
+  weight_decay:   6e-5
+  optimizer:      adamw
   scheduler:
-    type: onecycle
-    max_lr: 2e-4
-    pct_start: 0.3
-    div_factor: 10
-    final_div_factor: 100
-  freeze_after_epoch: 5
-  unfreeze_epoch: 8
-  unfreeze_lr: 1e-5
-  ema_decay: 0.999
-  save_dir: "checkpoints"
+    type:              onecycle
+    max_lr:            7e-4        # peak LR
+    pct_start:         0.2
+    div_factor:        10
+    final_div_factor:  1000
+    anneal_strategy:   cosine
 
-  # ACCURACY FIX: Set both weights to 1.0 since we are only using high-SNR data
-  snr_loss_weight_low: 1.0
-  snr_loss_weight_high: 1.0
+  focal_gamma:      1.2            # slightly stronger focal weighting
+  label_smoothing:  0.03
+  grad_clip_norm:   1.0
 
-  use_torch_compile: true
-
-feature_cache:
-  seg_feats: true
-  use_pca: true
-  pca_dim: 64
-  overwrite: false
-  ckpt_path: "checkpoints/best.pth"
-  batch_size: 1024
+  save_dir:              "checkpoints"
+  snr_loss_weight_low:   1.0
+  snr_loss_weight_high:  3.5       # ↑ emphasize high-SNR correctness
 
 curriculum:
-  # ACCURACY FIX: Disable curriculum as we are manually filtering the dataset
-  enabled: false
-  start_snr_db: -20
-  end_snr_db: 20
-  pace_epochs: 8
-  mask_val: false
+  enabled:      true
+  start_snr_db: -20.0
+  end_snr_db:   20                 # widen target band as you ramp
+  pace_epochs:  8                  # slower ramp for deeper model
+  mask_val:     true
 
 regularization:
-  dropedge_prob: 0.10
-  graphnorm: true
+  dropedge_prob: 0.20              # a touch lighter than before
+  graphnorm:     true
 
-eval:
-  tta:
-    enabled: false
-    n_rolls: 10
+autoenc:
+  noise_std: 0.02
+  use_amp:   true
+  snr_low:   -20.0
+  snr_high:  0.0
+  epochs:    5
+  batch_size:         2048
+  num_workers:        4
+  pin_memory:         true
+  prefetch_factor:    2
+  persistent_workers: false
+  max_steps:          600
+  max_minutes:        10

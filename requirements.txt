@@ -1,19 +1,25 @@
-#Core ML & Data Handling
-numpy
-torch
-torchaudio
+# Use PyTorch stable and PyG wheels for torch 2.1.0+cu118
+--find-links https://download.pytorch.org/whl/torch_stable.html
+--find-links https://data.pyg.org/whl/torch-2.1.0+cu118.html
+
+# Core ML & Data Handling
+numpy<2
+torch==2.1.0+cu118
+torchaudio==2.1.0+cu118
 h5py
 PyYAML
 scikit-learn
 scipy
+tqdm
 
-#GNN & Vision Models
-torch-geometric
+# GNN & Vision Models
 timm
+torch-scatter
+torch-sparse
+torch-cluster
+torch-spline-conv
+torch-geometric
 
-#Signal Processing & Wavelets
+# Signal Processing & Wavelets
 kymatio
 PyWavelets
-
-Utilities
-tqdm

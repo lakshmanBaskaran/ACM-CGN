@@ -1,127 +1,119 @@
 # SPDX-License-Identifier: MIT
 import os
+import math
 import yaml
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from dsp_utils import estimate_snr
-from tqdm import tqdm
 
-# Load config once to get necessary parameters
+# ─────────────────────────────────────────────────────────────────────────────
+# Load save_dtype with UTF-8 decoding
 with open("configs/config.yaml", "r", encoding="utf-8") as _f:
-    CFG = yaml.safe_load(_f)
-
-_FEAT_CFG = CFG.get("feature_cache", {})
-_USE_FEATS = bool(_FEAT_CFG.get("seg_feats", True))
-_USE_PCA = bool(_FEAT_CFG.get("use_pca", False))
-_SEG_FEAT_DIM = int(CFG["model"]["seg_feat_dim"])
-# ACCURACY FIX: Read the new dataset filtering section from the config
-_DATASET_CFG = CFG.get("dataset", {})
-
+    _SAVE_DTYPE = yaml.safe_load(_f)["preprocess"]["save_dtype"]
 
 class _ShardView:
-    """A view into a single data shard that memory-maps all feature files."""
-
-    def __init__(self, base: str, sid: int):
+    """Memory-maps one shard (handles optional CWT and DWT)."""
+    def __init__(self, base, sid):
         self.base, self.sid = base, sid
         self._open()
 
     def _open(self):
-        sid = self.sid
+        self.tm = np.load(f"{self.base}/X_tm_{self.sid}.npy",  mmap_mode="r")
+        self.sp = np.load(f"{self.base}/X_spec_{self.sid}.npy", mmap_mode="r")
+        cwt_path = f"{self.base}/X_cwt_{self.sid}.npy"
+        self.has_cwt = _SAVE_DTYPE["cwt"] is not None and os.path.exists(cwt_path)
+        self.cw = np.load(cwt_path, mmap_mode="r") if self.has_cwt else None
+        dwt_path = f"{self.base}/X_dwt_{self.sid}.npy"
+        self.has_dwt = _SAVE_DTYPE.get("dwt") is not None and os.path.exists(dwt_path)
+        self.dw = np.load(dwt_path, mmap_mode="r") if self.has_dwt else None
+        self.y  = np.load(f"{self.base}/y_{self.sid}.npy",    mmap_mode="r")
+        self.n  = len(self.y)
 
-        def load_memmap(path):
-            return np.load(path, mmap_mode="r") if os.path.exists(path) else None
+    def __getstate__(self):
+        return {"base": self.base, "sid": self.sid}
 
-        self.tm = load_memmap(f"{self.base}/X_tm_{sid}.npy")
-        self.sp = load_memmap(f"{self.base}/X_spec_{sid}.npy")
-        self.eng = load_memmap(f"{self.base}/X_eng_{sid}.npy")
-        self.scat = load_memmap(f"{self.base}/X_scat_{sid}.npy")
-        self.cw = load_memmap(f"{self.base}/X_cwt_{sid}.npy")
-        self.dw = load_memmap(f"{self.base}/X_dwt_{sid}.npy")
-        self.y = load_memmap(f"{self.base}/y_{sid}.npy")
-        self.snr = load_memmap(f"{self.base}/X_snr_{sid}.npy")  # Keep loading for getitem
-        self.fe = None
-
-        if _USE_FEATS:
-            pca_p = f"{self.base}/X_segfeat_pca_{sid}.npy"
-            raw_p = f"{self.base}/X_segfeat_{sid}.npy"
-            path_to_load = pca_p if _USE_PCA and os.path.exists(pca_p) else (raw_p if os.path.exists(raw_p) else None)
-            if path_to_load:
-                arr = load_memmap(path_to_load)
-                if arr is not None and arr.shape[-1] == _SEG_FEAT_DIM:
-                    self.fe = arr
-
-        self.n = len(self.y) if self.y is not None else 0
-
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._open()
 
 class RadioMLDataset(Dataset):
-    def __init__(self, proc_dir, split, augment=False):
+    """
+    Stitches sharded *.npy files and returns samples as:
+      { "tm":(T,4), "spec":(F,T,2), "cwt":(Scales,T)|empty,
+        "dwt":(Levels,T)|empty, "snr":float, "y":int }.
+    """
+    def __init__(
+        self,
+        proc_dir,
+        split,
+        augment=False,
+        seg_cfg=None,
+        aug_cfg=None,
+        min_snr_db: float = None,
+        max_snr_db: float = None
+    ):
         self.base = os.path.abspath(os.path.join(proc_dir, split))
-        self.augment = augment
-        self.view_cache = {}
+        shards = sorted(
+            int(f.split("_")[-1].split(".")[0])
+            for f in os.listdir(self.base)
+            if f.startswith("y_")
+        )
+        self.views = [_ShardView(self.base, s) for s in shards]
+        self.offsets = np.cumsum([0] + [v.n for v in self.views])
+        self.N_raw   = self.offsets[-1]
 
-        # ACCURACY FIX: Get filtering parameters from config
-        self.min_snr_db = _DATASET_CFG.get("min_snr_db", -99)
-        self.classes_to_exclude = set(_DATASET_CFG.get("classes_to_exclude", []))
+        self.augment, self.aug = augment, aug_cfg or {}
+        self.min_snr_db = min_snr_db
+        self.max_snr_db = max_snr_db
 
-        # This list will store tuples of (shard_id, local_index, snr_value) for valid samples
-        self.valid_indices = []
-        self.label_map = {}
+        # Skip global SNR scan unless filtering is requested
+        if self.min_snr_db is None and self.max_snr_db is None:
+            self.valid_idxs = list(range(self.N_raw))
+        else:
+            self._build_index()
+        self.N = len(self.valid_idxs)
 
-        if os.path.exists(self.base):
-            shard_ids = sorted({
-                int(fn.split("_")[-1].split(".")[0])
-                for fn in os.listdir(self.base) if fn.startswith("y_") and fn.endswith(".npy")
-            })
+    def _snr(self, x: np.ndarray) -> float:
+        I, Q = x[:,0], x[:,1]
+        power = (I*I + Q*Q).mean()
+        noise_var = np.var(I - I.mean()) + np.var(Q - Q.mean()) + 1e-12
+        return 10 * math.log10(power / noise_var)
 
-            print(
-                f"INFO: Filtering '{split}' dataset for SNR >= {self.min_snr_db} dB and excluding classes {list(self.classes_to_exclude)}...")
-            pbar = tqdm(shard_ids, desc=f"  [Scanning {split} Shards]")
-            for sid in pbar:
-                # Temporarily open views to get data for filtering
-                temp_view = _ShardView(self.base, sid)
-                if temp_view.y is not None and temp_view.tm is not None:
-                    labels = temp_view.y
-                    tm_data = temp_view.tm
-                    # Calculate SNR on the fly for every sample in the shard
-                    for i in range(len(labels)):
-                        if labels[i] not in self.classes_to_exclude:
-                            snr_val = estimate_snr(tm_data[i])
-                            if snr_val >= self.min_snr_db:
-                                self.valid_indices.append((sid, i, snr_val))
-
-            # Create a mapping from old labels to new, contiguous labels (0, 1, 2, ...)
-            original_num_classes = 24
-            all_labels = sorted(list(set(range(original_num_classes)) - self.classes_to_exclude))
-            self.label_map = {old_label: new_label for new_label, old_label in enumerate(all_labels)}
-
-        self.N = len(self.valid_indices)
-        print(f"INFO: Found {self.N} samples matching the criteria.")
+    def _build_index(self):
+        self.valid_idxs = []
+        for gid in range(self.N_raw):
+            shard_i = np.searchsorted(self.offsets, gid, side="right") - 1
+            local   = gid - self.offsets[shard_i]
+            tm      = self.views[shard_i].tm[local].astype("float32")
+            snr_db  = self._snr(tm)
+            if ((self.min_snr_db is None or snr_db >= self.min_snr_db)
+            and  (self.max_snr_db is None or snr_db <= self.max_snr_db)):
+                self.valid_idxs.append(gid)
 
     def __len__(self):
         return self.N
 
-    def _get_shard_view(self, shard_id):
-        if shard_id not in self.view_cache:
-            self.view_cache[shard_id] = _ShardView(self.base, shard_id)
-        return self.view_cache[shard_id]
+    def _augment(self, x: np.ndarray) -> np.ndarray:
+        if self.augment and np.random.rand() < self.aug.get("time_shift_prob", 0):
+            x = np.roll(x, np.random.randint(1, x.shape[0]), axis=0)
+        return x
 
-    def __getitem__(self, idx):
-        shard_id, local_idx, snr_val = self.valid_indices[idx]
-        v = self._get_shard_view(shard_id)
+    def __getitem__(self, idx: int):
+        gid     = self.valid_idxs[idx]
+        shard_i = np.searchsorted(self.offsets, gid, side="right") - 1
+        local   = gid - self.offsets[shard_i]
+        v       = self.views[shard_i]
 
-        original_label = int(v.y[local_idx])
-        new_label = self.label_map[original_label]
+        x4  = v.tm[local].astype("float32")
+        x4  = self._augment(x4)
+        snr = self._snr(x4)
 
         sample = {
-            "tm": torch.from_numpy(v.tm[local_idx].copy()),
-            "spec": torch.from_numpy(v.sp[local_idx].copy()),
-            "eng_feats": torch.from_numpy(v.eng[local_idx].copy()),
-            "y": torch.tensor(new_label, dtype=torch.int64),
-            "snr": torch.tensor(snr_val, dtype=torch.float32)  # Use the on-the-fly calculated SNR
+            "tm":   torch.from_numpy(x4),
+            "spec": torch.from_numpy(v.sp[local].astype("float32")),
+            "snr":  torch.tensor(snr, dtype=torch.float32),
+            "y":    torch.tensor(int(v.y[local]), dtype=torch.int64),
         }
-
-        for key, attr in [("scat", v.scat), ("cwt", v.cw), ("dwt", v.dw), ("seg_feats", v.fe)]:
-            sample[key] = torch.from_numpy(attr[local_idx].copy()) if attr is not None else torch.empty(0)
-
+        sample["cwt"] = torch.from_numpy(v.cw[local].astype("float32")) if v.has_cwt else torch.empty(0)
+        sample["dwt"] = torch.from_numpy(v.dw[local].astype("float32")) if v.has_dwt else torch.empty(0)
         return sample
