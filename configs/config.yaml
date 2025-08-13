@@ -49,17 +49,33 @@ augmentation:
 
 model:
   use_sag_pool: true
-  graph_connectivity: full          # ↑ accuracy (slower than 'chain')
+  graph_connectivity: chain
   gnn_impl: gatv2
   input_channels: 4
-  seg_feat_dim:   192              # ↑ capacity for segment encoder
-  gnn_hidden_dim: 384              # ↑ backbone width
-  gnn_heads:      4
-  gnn_layers:     8                # deeper GNN
-  sag_pool_ratio: 0.5
+  seg_feat_dim:   192
+  gnn_hidden_dim: 256
+  gnn_heads:      2
+  gnn_layers:     6
+  sag_pool_ratio: 0.4
   dropout:        0.15
   num_classes:    24
   snr_split_db:   10.0
+
+  # Apply the pretrained AE as a frozen denoiser in forward()
+  use_autoenc_denoise: true
+
+  # Time-segment denoiser inside the segment encoder ("1d" | "2d" | "none")
+  denoiser_type: "1d"
+
+  # Optional: run a small transformer across segments before the GNN
+  seg_transformer:
+    enabled: false
+    layers: 2
+    heads: 4
+    mlp_ratio: 2.0
+    drop: 0.0
+    drop_path: 0.05
+
   use_experts:
     psk: true
     qam: true
@@ -67,53 +83,61 @@ model:
 
 training:
   use_autoenc:   true
-  use_compile:   true              # compile encoders/head; PyG kept eager by model wrapper
+  use_compile:   false
   compile_mode:  reduce-overhead
-  compile_pyg:   false             # set true only if PyG >= 2.5
+  compile_pyg:   false
   channels_last: true
   adamw_fused:   false
   device:        cuda
 
-  batch_size:        4096
+  # --- faster base training ---
+  batch_size:        2048
   micro_batch_size:  1024
-  test_batch_size:   4096
+  test_batch_size:   2048
 
   num_workers:       8
   prefetch_factor:   6
-  epochs:            50            # a bit longer to fit deeper model
+  epochs:            40
 
-  max_samples_per_epoch: 0
-  val_max_batches:       200
+  # BIG speed lever: cap per-epoch samples
+  max_samples_per_epoch: 700000
 
-  # Optimizer & scheduler (OneCycle generally converges stronger here)
-  lr:             2e-4             # base LR (unused by OneCycle's max_lr but kept for safety)
+  # Validation controls:
+  # NOTE: during finetune the code enforces a minimum of 10 batches for speed.
+  # Shuffle validation to mitigate partial-eval bias for macro-F1.
+  val_max_batches:       25
+  shuffle_val:           true
+  f1_skip_zero_support:  true
+  f1_report_weighted:    true
+
+  lr:             2e-4
   weight_decay:   6e-5
   optimizer:      adamw
   scheduler:
     type:              onecycle
-    max_lr:            7e-4        # peak LR
+    max_lr:            7e-4
     pct_start:         0.2
     div_factor:        10
     final_div_factor:  1000
     anneal_strategy:   cosine
 
-  focal_gamma:      1.2            # slightly stronger focal weighting
+  focal_gamma:      1.2
   label_smoothing:  0.03
   grad_clip_norm:   1.0
 
   save_dir:              "checkpoints"
   snr_loss_weight_low:   1.0
-  snr_loss_weight_high:  3.5       # ↑ emphasize high-SNR correctness
+  snr_loss_weight_high:  3.5
 
 curriculum:
   enabled:      true
   start_snr_db: -20.0
-  end_snr_db:   20                 # widen target band as you ramp
-  pace_epochs:  8                  # slower ramp for deeper model
+  end_snr_db:   20
+  pace_epochs:  8
   mask_val:     true
 
 regularization:
-  dropedge_prob: 0.20              # a touch lighter than before
+  dropedge_prob: 0.20
   graphnorm:     true
 
 autoenc:
@@ -129,3 +153,26 @@ autoenc:
   persistent_workers: false
   max_steps:          600
   max_minutes:        10
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 1 finetune: focus on 10–30 dB with class-balancing.
+finetune:
+  enabled: true
+  load_from: "checkpoints/best_10_30.pth"   # or "checkpoints/last.pth"
+  epochs: 5
+  lr: 1.0e-4
+  scheduler: cosine
+  curriculum_enabled: false
+
+  # SNR window for phase 1
+  min_snr_db: 10.0
+  max_snr_db: 30.0
+  class_balance: true
+
+  graph_connectivity: full   # denser graph for FT
+  override_gnn_heads: null   # keep same heads (no reinit)
+  focal_gamma: 0.0
+  label_smoothing: 0.01
+  snr_loss_weight_high: 4.2
+  ema_decay: 0.999
+  tta_shifts: 3

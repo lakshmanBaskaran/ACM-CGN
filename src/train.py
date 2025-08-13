@@ -1,40 +1,32 @@
-# SPDX-License-Identifier: MIT
-# --- allocator tuning BEFORE torch import (avoid allocator bug) -------------
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
 os.environ.setdefault("TORCHINDUCTOR_CUDAGRAPHS", "0")
 os.environ.setdefault("TORCHINDUCTOR_CUDAGRAPH_TREES", "0")
 
-import yaml
-import time
-import multiprocessing
-import logging
-import json
-import csv
-import warnings
+import yaml, time, multiprocessing, logging, json, csv, warnings
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, Dataset
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, Dataset, WeightedRandomSampler
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
-# quiet noisy but harmless warnings
+# quiet, harmless warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision.io.image")
-warnings.filterwarnings("ignore", message=".*'has_cuda' is deprecated.*")
-warnings.filterwarnings("ignore", message=".*'has_cudnn' is deprecated.*")
-warnings.filterwarnings("ignore", message=".*'has_mps' is deprecated.*")
-warnings.filterwarnings("ignore", message=".*'has_mkldnn' is deprecated.*")
+for msg in ("'has_cuda' is deprecated", "'has_cudnn' is deprecated",
+            "'has_mps' is deprecated", "'has_mkldnn' is deprecated",
+            "Detected call of `lr_scheduler.step"):
+    warnings.filterwarnings("ignore", message=f".*{msg}.*")
 
 import torch._dynamo
 torch._dynamo.config.cache_size_limit = 64
 torch._dynamo.config.suppress_errors  = True
 logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
 
-# extra belt-and-suspenders: make Inductor avoid cudagraphs where possible
+# Also hard-disable Inductor cudagraphs via config
 try:
     import torch._inductor.config as _ind_cfg
     if hasattr(_ind_cfg, "triton") and hasattr(_ind_cfg.triton, "cudagraphs"):
@@ -46,7 +38,7 @@ try:
 except Exception:
     pass
 
-# Prefer Flash/Mem-efficient SDPA for MultiheadAttention when possible
+# Prefer Flash/Mem-efficient SDPA
 try:
     from torch.backends.cuda import sdp_kernel
     sdp_kernel.enable_flash(True)
@@ -58,7 +50,7 @@ except Exception:
 from dataset import RadioMLDataset
 from model import DenoiserAutoEnc, MultiBranchGNNClassifier as GNNModClassifier
 
-# ─────────── speed flags ─────────────────────────────────────────────────────
+# ─────────── speed flags (unchanged numerics) ────────────────────────────────
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32       = True
 torch.backends.cudnn.benchmark        = True
@@ -67,8 +59,46 @@ try:
 except Exception:
     pass
 
+# ─────────── helpers ─────────────────────────────────────────────────────────
+def _tqdm(iterable, total, desc, leave=False, position=0):
+    return tqdm(iterable, total=total, desc=desc, dynamic_ncols=True, leave=leave, position=position)
 
-# ─────────── CUDA prefetcher ─────────────────────────────────────────────────
+def _f(x, d=0.0): return d if x is None else float(x)
+
+# Simple EMA for finetune
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.decay = float(decay)
+        self.enabled = self.decay > 0
+        self.shadow = {}
+        if not self.enabled: return
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[n] = p.detach().clone()
+
+    @torch.no_grad()
+    def update(self, model):
+        if not self.enabled: return
+        for n, p in model.named_parameters():
+            if p.requires_grad and n in self.shadow:
+                self.shadow[n].mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
+
+    def apply_shadow(self, model):
+        if not self.enabled: return None
+        backup = {}
+        for n, p in model.named_parameters():
+            if p.requires_grad and n in self.shadow:
+                backup[n] = p.detach().clone()
+                p.data.copy_(self.shadow[n].data)
+        return backup
+
+    def restore(self, model, backup):
+        if not self.enabled or backup is None: return
+        for n, p in model.named_parameters():
+            if n in backup:
+                p.data.copy_(backup[n].data)
+
+# CUDA prefetcher: overlaps H2D
 class CUDAPrefetcher:
     def __init__(self, loader, device, keys=("tm","spec","cwt","snr","y"), use_channels_last=True):
         self.loader = iter(loader)
@@ -108,32 +138,30 @@ class CUDAPrefetcher:
         self._preload()
         return batch
 
-
-def _tqdm(iterable, total, desc, leave=False, position=0):
-    return tqdm(iterable, total=total, desc=desc, dynamic_ncols=True, leave=leave, position=position)
-
-
 # ───────── config loader ─────────────────────────────────────────────────────
-def _f(x, d=0.0): return d if x is None else float(x)
-
 def load_cfg():
     with open("configs/config.yaml","r") as f:
         cfg = yaml.safe_load(f)
+
     tr = cfg["training"]
-    # ints
+
+    # ints/floats
     for k in ("batch_size","test_batch_size","epochs"):
         tr[k] = int(tr[k])
-    # floats
     for k in ("lr","weight_decay","focal_gamma","label_smoothing",
               "grad_clip_norm","snr_loss_weight_low","snr_loss_weight_high"):
         tr[k] = _f(tr.get(k),1.0)
-    # toggles / knobs
+
+    # toggles + new eval controls
     tr.setdefault("use_autoenc",  True)
-    tr.setdefault("use_compile",  False)
+    tr["use_compile"] = False
+    tr["compile_pyg"] = False
     tr.setdefault("compile_mode", "reduce-overhead")
-    tr.setdefault("compile_pyg",  False)
     tr.setdefault("channels_last", True)
     tr.setdefault("adamw_fused", False)
+    tr.setdefault("shuffle_val", False)           # NEW: allow shuffled val sampling
+    tr.setdefault("f1_skip_zero_support", True)   # NEW: macro-F1 ignores zero-support classes
+    tr.setdefault("f1_report_weighted", True)     # NEW: also report weighted F1
 
     # capping + micro-batch
     tr["max_samples_per_epoch"] = int(tr.get("max_samples_per_epoch", 0))
@@ -141,7 +169,7 @@ def load_cfg():
     tr["micro_batch_size"]      = int(tr.get("micro_batch_size", 0))
 
     # workers
-    max_w = min(8, max(1, multiprocessing.cpu_count()-1))
+    max_w = min(12, max(1, multiprocessing.cpu_count()-1))
     tr["num_workers"]        = int(tr.get("num_workers", max_w))
     tr["persistent_workers"] = tr["num_workers"] > 0
     tr["prefetch_factor"]    = max(2, int(tr.get("prefetch_factor", 2)))
@@ -171,13 +199,34 @@ def load_cfg():
     ae.setdefault("persistent_workers", False)
     ae.setdefault("max_steps",          600)
     ae.setdefault("max_minutes",        10)
-    ae.setdefault("use_compile",        tr.get("use_compile", False))
-    ae.setdefault("compile_mode",       tr.get("compile_mode", "reduce-overhead"))
+    ae["use_compile"]  = False
+    ae["compile_mode"] = tr.get("compile_mode", "reduce-overhead")
+
+    # ----- Optional finetune overrides -----
+    ft = cfg.get("finetune", {}) or {}
+    if bool(ft.get("enabled", False)):
+        # Hyperparams
+        tr["epochs"] = int(ft.get("epochs", 5))
+        tr["lr"]     = _f(ft.get("lr", 1e-4), 1e-4)
+        tr["focal_gamma"] = _f(ft.get("focal_gamma", 0.0), 0.0)
+        tr["label_smoothing"] = _f(ft.get("label_smoothing", 0.01), 0.01)
+        tr["snr_loss_weight_high"] = _f(ft.get("snr_loss_weight_high", 4.2), 4.2)
+        # Val faster during finetune (you can still force full eval with val_max_batches: 0)
+        tr["val_max_batches"] = max(10, int(tr.get("val_max_batches", 25)))
+        # Scheduler to cosine short run
+        tr["scheduler"] = {"type":"cosine","T_max":tr["epochs"],"eta_min":0.0}
+        # Model graph override(s)
+        mdl = cfg["model"]
+        mdl["graph_connectivity"] = ft.get("graph_connectivity", mdl.get("graph_connectivity","chain"))
+        if ft.get("override_gnn_heads", None) is not None:
+            mdl["gnn_heads"] = int(ft["override_gnn_heads"])
+        # Curriculum disabled for finetune unless explicitly asked
+        cfg["curriculum"]["enabled"] = bool(ft.get("curriculum_enabled", False))
+
     return cfg
 
-
 # ─── optimizer + scheduler ───────────────────────────────────────────────────
-def build_optim_and_sched(net, tr, steps_per_epoch, device):
+def build_optim_and_sched(net, tr, steps_per_epoch):
     fused_flag = bool(tr.get("adamw_fused", False))
     if fused_flag and tr.get("channels_last", True):
         print("⚠️  Disabling fused AdamW because channels_last is enabled (mixed layouts).")
@@ -185,10 +234,7 @@ def build_optim_and_sched(net, tr, steps_per_epoch, device):
 
     opt_kwargs = dict(lr=tr["lr"], weight_decay=tr["weight_decay"])
     try:
-        if fused_flag:
-            opt = optim.AdamW(net.parameters(), **opt_kwargs, fused=True)
-        else:
-            opt = optim.AdamW(net.parameters(), **opt_kwargs)
+        opt = optim.AdamW(net.parameters(), **opt_kwargs, fused=fused_flag)  # fused may not exist → fallback below
     except TypeError:
         opt = optim.AdamW(net.parameters(), **opt_kwargs)
 
@@ -202,14 +248,13 @@ def build_optim_and_sched(net, tr, steps_per_epoch, device):
             pct_start=sc["pct_start"],
             div_factor=sc["div_factor"],
             final_div_factor=sc["final_div_factor"],
-            anneal_strategy="cos" if sc["anneal_strategy"].startswith("cos") else "linear"
+            anneal_strategy="cos" if sc.get("anneal_strategy","cosine").startswith("cos") else "linear"
         )
         per_batch=True
     else:
-        sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=sc["T_max"], eta_min=sc["eta_min"])
+        sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=int(sc.get("T_max", tr["epochs"])), eta_min=_f(sc.get("eta_min",0.0),0.0))
         per_batch=False
     return opt, sched, per_batch
-
 
 # ─── metrics helpers ─────────────────────────────────────────────────────────
 def update_topk_counters(logits, labels, topk_counts, total):
@@ -217,9 +262,9 @@ def update_topk_counters(logits, labels, topk_counts, total):
         float_logits = logits.float()
         B = labels.size(0)
         _, pred = float_logits.topk(5,dim=1)
-        for k in (1,3,5):
-            correct_k = (pred[:,:k]==labels.unsqueeze(1)).any(dim=1).sum().item()
-            topk_counts[f"top{k}"] += correct_k
+        topk_counts["top1"] += (pred[:,:1]==labels.unsqueeze(1)).any(dim=1).sum().item()
+        topk_counts["top3"] += (pred[:,:3]==labels.unsqueeze(1)).any(dim=1).sum().item()
+        topk_counts["top5"] += (pred[:,:5]==labels.unsqueeze(1)).any(dim=1).sum().item()
         total[0] += B
 
 def update_confusion(conf_all, conf_bins, bins, edges, preds, trues, snrs):
@@ -230,6 +275,7 @@ def update_confusion(conf_all, conf_bins, bins, edges, preds, trues, snrs):
         idx = max(0,min(idx,len(bins)-1))
         conf_bins[bins[idx]][t,p] += 1
 
+# (kept for backward compatibility if you need per-class F1s only)
 def compute_f1_from_conf(conf):
     C = conf.shape[0]
     f1s=[]
@@ -247,6 +293,40 @@ def compute_f1_from_conf(conf):
         f1s.append(float(f1))
     return f1s
 
+# NEW: clean macro-F1 (skip zero-support) + weighted-F1
+def compute_f1_per_class(conf):
+    C = conf.shape[0]
+    f1s, supports = [], []
+    for c in range(C):
+        tp = conf[c, c]
+        fp = conf[:, c].sum() - tp
+        fn = conf[c, :].sum() - tp
+        support = conf[c, :].sum()
+        supports.append(int(support))
+        if tp + fp > 0 and tp + fn > 0:
+            precision = tp / (tp + fp)
+            recall    = tp / (tp + fn)
+            den = (precision + recall)
+            f1 = 0.0 if den == 0 else (2 * precision * recall / den)
+        else:
+            f1 = 0.0
+        f1s.append(float(f1))
+    return f1s, supports
+
+def macro_and_weighted_f1(conf, skip_zero_support=True):
+    f1s, supports = compute_f1_per_class(conf)
+    supp = np.array(supports, dtype=np.float64)
+    f1a  = np.array(f1s, dtype=np.float64)
+
+    if skip_zero_support:
+        mask = supp > 0
+        macro = float(f1a[mask].mean()) if mask.any() else 0.0
+    else:
+        macro = float(f1a.mean())
+
+    total = supp.sum()
+    weighted = float((f1a * supp).sum() / total) if total > 0 else 0.0
+    return f1s, supports, macro, weighted
 
 # ─── label/shape sanity checks ───────────────────────────────────────────────
 def _ensure_targets_ok(y: torch.Tensor, num_classes: int, where: str):
@@ -268,7 +348,6 @@ def _ensure_logits_ok(logits: torch.Tensor, num_classes: int, where: str):
             "Check model head and config."
         )
 
-
 # ─── micro-batch loops ───────────────────────────────────────────────────────
 def _chunk_slices(B, micro_bs):
     if micro_bs <= 0 or micro_bs >= B:
@@ -276,19 +355,7 @@ def _chunk_slices(B, micro_bs):
     for start in range(0, B, micro_bs):
         yield slice(start, min(B, start+micro_bs))
 
-class CompilePoolError(RuntimeError):
-    pass
-
-def _is_compile_capture_err(msg_lower: str) -> bool:
-    return (
-        ("could not find 0x" in msg_lower) or
-        ("cudagraph" in msg_lower) or
-        ("stream is capturing" in msg_lower) or
-        ("during capture" in msg_lower) or
-        ("capture_end" in msg_lower)
-    )
-
-def train_step_with_microbatch(net, batch, tr, device, opt, scaler, num_classes: int, sched=None, per_batch: bool=False):
+def train_step_with_microbatch(net, batch, tr, device, opt, scaler, num_classes: int, ema=None, sched=None, per_batch: bool=False):
     tm = batch["tm"]; bsp = batch["spec"]; cwt = batch["cwt"]; snr = batch["snr"]; y = batch["y"]
     B  = y.size(0)
     micro_bs = int(tr.get("micro_batch_size", 0))
@@ -320,19 +387,39 @@ def train_step_with_microbatch(net, batch, tr, device, opt, scaler, num_classes:
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(net.parameters(), tr["grad_clip_norm"])
             scaler.step(opt); scaler.update()
+            if ema is not None: ema.update(getattr(net, "module", net))
             if per_batch and (sched is not None):
-                # step AFTER optimizer.step() to avoid the LR warning
-                sched.step()
+                sched.step()  # after opt.step()
             return total_loss/max(1,total_seen), total_correct, total_seen, micro_bs
         except RuntimeError as e:
             msg = str(e).lower()
-            if _is_compile_capture_err(msg):
-                raise CompilePoolError(e)
             if "out of memory" not in msg:
                 raise
             torch.cuda.empty_cache()
             micro_bs = max(1, (micro_bs or (B//2)) // 2)
             if micro_bs == 1: raise
+
+def _roll_for_tta(batch, seg_cfg, seg_shift_units):
+    """
+    seg_shift_units: integer shift in SEGMENT units (…,-1,0,+1,…)
+    Rolls:
+      - tm by samples = step * seg_shift_units
+      - spec by seg units along time axis
+      - cwt by samples along last axis
+    """
+    if seg_shift_units == 0:
+        return batch
+
+    step = int(seg_cfg["segment_len"] * (1 - seg_cfg["overlap"]))
+    samp_shift = int(seg_shift_units * step)
+
+    tm  = batch["tm"].roll(shifts=samp_shift, dims=1)
+    sp  = batch["spec"].roll(shifts=seg_shift_units, dims=2)  # (B,F,Tseg,2)
+    cwt = batch["cwt"]
+    if isinstance(cwt, torch.Tensor) and cwt.numel() > 0:
+        cwt = cwt.roll(shifts=samp_shift, dims=2)              # (B,S,T)
+
+    return {"tm": tm, "spec": sp, "cwt": cwt, "snr": batch["snr"], "y": batch["y"]}
 
 def val_step_with_microbatch(net, batch, tr, num_classes: int):
     tm = batch["tm"]; bsp = batch["spec"]; cwt = batch["cwt"]; snr = batch["snr"]; y = batch["y"]
@@ -349,13 +436,30 @@ def val_step_with_microbatch(net, batch, tr, num_classes: int):
                 preds_all.append(logits)
     return torch.cat(preds_all, dim=0)
 
+def val_step_with_tta(net, batch, tr, num_classes: int, seg_cfg, tta_shifts: int):
+    # Build symmetric small shift set (in segment units)
+    if tta_shifts <= 1:
+        return val_step_with_microbatch(net, batch, tr, num_classes)
+
+    half = tta_shifts // 2
+    if tta_shifts % 2 == 1:
+        shifts = list(range(-half, half + 1))  # e.g., 3 -> [-1,0,1]
+    else:
+        shifts = [s for s in range(-half, 0)] + [s for s in range(1, half + 1)]  # e.g., 2 -> [-1,1]
+
+    logits_accum = None
+    with torch.inference_mode():
+        for s in shifts:
+            b = _roll_for_tta(batch, seg_cfg, s)
+            out = val_step_with_microbatch(net, b, tr, num_classes)
+            logits_accum = out if logits_accum is None else (logits_accum + out)
+    return logits_accum / float(len(shifts))
 
 # ─── tm-only AE dataset (fast pretrain) ──────────────────────────────────────
 def _snr_batch_tm(x4: np.ndarray) -> np.ndarray:
     I, Q = x4[..., 0], x4[..., 1]
     power = (I*I + Q*Q).mean(axis=1)
-    Imean = I.mean(axis=1, keepdims=True)
-    Qmean = Q.mean(axis=1, keepdims=True)
+    Imean = I.mean(axis=1, keepdims=True); Qmean = Q.mean(axis=1, keepdims=True)
     noise = ((I - Imean)**2).mean(axis=1) + ((Q - Qmean)**2).mean(axis=1) + 1e-12
     return 10.0 * np.log10(power / noise)
 
@@ -389,47 +493,26 @@ class AEDenoiseDataset(Dataset):
         tm = np.array(self.mems[si][j], dtype=np.float32, copy=True)
         return {"tm": torch.from_numpy(tm)}
 
-
-# ─── helpers to robustly fall back to eager ──────────────────────────────────
-def _extract_state_dict_from_any(model):
-    """Works with nn.Module, DataParallel(nn.Module), and compiled wrappers."""
-    if isinstance(model, torch.nn.DataParallel):
-        model = model.module
-    # compiled wrappers still expose state_dict; fall back to _orig_mod if present
-    try:
-        return model.state_dict()
-    except Exception:
-        base = getattr(model, "_orig_mod", model)
-        return base.state_dict()
-
-def _rebuild_eager_model_from(net_or_dp, cfg, device, channels_last=True):
-    """Create a fresh eager model and load weights from an arbitrary (possibly compiled/DP) model."""
-    sd = _extract_state_dict_from_any(net_or_dp)
-    fresh = GNNModClassifier(cfg).to(device)
-    if channels_last:
-        fresh = fresh.to(memory_format=torch.channels_last)
-    missing, unexpected = fresh.load_state_dict(sd, strict=False)
-    if missing or unexpected:
-        # Non-fatal; print once to help debugging
-        print(f"ℹ️ eager reload: missing={len(missing)}, unexpected={len(unexpected)}")
-    if torch.cuda.device_count()>1:
-        fresh = torch.nn.DataParallel(fresh)
-    return fresh
-
-
 # ─── main ────────────────────────────────────────────────────────────────────
 def main():
     print("🚀  starting training …")
     C      = load_cfg()
     tr     = C["training"]
     ae_cfg = C["autoenc"]
+    ft_cfg = C.get("finetune", {}) or {}
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(tr["save_dir"], exist_ok=True)
 
+    # datasets (val is static; train uses curriculum or finetune filtering)
+    # validation/test split is always the original "test"
+    test_ds  = RadioMLDataset(C["data"]["processed_dir"],"test",
+                              augment=False, seg_cfg=C["segmentation"], aug_cfg=C["augmentation"],
+                              min_snr_db=None, max_snr_db=None)
+
     # ── optional fast AE pretrain ────────────────────────────────────────────
     autoenc=None
-    if tr["use_autoenc"]:
+    if tr["use_autoenc"] and not bool(ft_cfg.get("enabled", False)):
         print(f"🔧  pretraining AE ({int(ae_cfg['snr_low'])}–{int(ae_cfg['snr_high'])} dB)…")
         max_samples = int(ae_cfg.get("max_steps", 0)) * int(ae_cfg["batch_size"]) if int(ae_cfg.get("max_steps", 0))>0 else 1_000_000
         ae_ds = AEDenoiseDataset(
@@ -446,12 +529,6 @@ def main():
             prefetch_factor=int(ae_cfg["prefetch_factor"]) if int(ae_cfg["num_workers"])>0 else None
         )
         autoenc=DenoiserAutoEnc(in_ch=4,hidden=32).to(device)
-        if ae_cfg.get("use_compile", False) and hasattr(torch, "compile"):
-            try:
-                autoenc = torch.compile(autoenc, mode=ae_cfg.get("compile_mode","reduce-overhead"),
-                                        fullgraph=False, dynamic=True)
-            except Exception as e:
-                print(f"⚠️ torch.compile (AE) skipped: {e}")
         ae_opt=optim.AdamW(autoenc.parameters(),lr=1e-3,weight_decay=1e-5)
         scaler=GradScaler(enabled=bool(ae_cfg["use_amp"]))
         autoenc.train()
@@ -459,19 +536,14 @@ def main():
         max_minutes = float(ae_cfg.get("max_minutes", 0) or 0)
         for ep in range(1, int(ae_cfg["epochs"]) + 1):
             epoch_loss = 0.0; seen = 0
-            pbar = _tqdm(ae_loader, total=len(ae_loader), desc=f"AE ep{ep:02d}", leave=False)
-            for step, batch in enumerate(pbar):
-                if max_minutes > 0:
-                    elapsed = (time.perf_counter() - start_wall) / 60.0
-                    if elapsed >= max_minutes:
-                        print(f"⏱️  AE time cap reached ({elapsed:.1f} min ≥ {max_minutes} min). Stopping AE pretrain early.")
-                        break
+            for step, batch in enumerate(_tqdm(ae_loader, total=len(ae_loader), desc=f"AE ep{ep:02d}", leave=False)):
+                if max_minutes > 0 and (time.perf_counter() - start_wall) / 60.0 >= max_minutes:
+                    print(f"⏱️  AE time cap reached. Stopping AE pretrain early.")
+                    break
                 tm = batch["tm"].to(device, non_blocking=True)
                 noise   = torch.randn_like(tm) * float(ae_cfg["noise_std"])
                 corrupt = tm + noise
-                with autocast(enabled=bool(ae_cfg["use_amp"])):
-                    recon = autoenc(corrupt)
-                    loss  = F.mse_loss(recon, tm)
+                with autocast(enabled=bool(ae_cfg["use_amp"])): recon = autoenc(corrupt); loss = F.mse_loss(recon, tm)
                 ae_opt.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
                 scaler.step(ae_opt); scaler.update()
@@ -479,69 +551,69 @@ def main():
                 if int(ae_cfg.get("max_steps", 0))>0 and (step+1) >= int(ae_cfg["max_steps"]):
                     break
             print(f" AE ep{ep:02d} ➜ mse {epoch_loss/max(1,seen):.8f}")
-            if max_minutes > 0 and (time.perf_counter() - start_wall) / 60.0 >= max_minutes:
-                break
         for p in autoenc.parameters(): p.requires_grad=False
         autoenc.eval()
 
-    # ── model: COMPILE BEFORE DataParallel ───────────────────────────────────
-    base_raw = GNNModClassifier(C).to(device)
+    # ── model ────────────────────────────────────────────────────────────────
+    base = GNNModClassifier(C).to(device)
     if tr.get("channels_last", True):
-        base_raw = base_raw.to(memory_format=torch.channels_last)
+        base = base.to(memory_format=torch.channels_last)
 
-    base = base_raw
-    if tr.get("compile_pyg", False):
-        try:
-            from torch_geometric.compile import compile as pyg_compile  # PyG >= 2.5
-            base = pyg_compile(base)
-            print("✅ torch_geometric.compile enabled.")
-        except Exception as e:
-            print(f"⚠️ torch_geometric.compile skipped: {e}")
-
+    # Load AE weights if we did pretrain
     if autoenc:
-        ae_src = getattr(autoenc, "_orig_mod", autoenc)
-        base.autoenc.load_state_dict(ae_src.state_dict(), strict=False)
-        for p in base.autoenc.parameters():
-            p.requires_grad = False
+        base.autoenc.load_state_dict(autoenc.state_dict(), strict=False)
+        for p in base.autoenc.parameters(): p.requires_grad = False
         base.autoenc.eval()
 
-    compiled_used = False
-    if tr.get("use_compile", False) and hasattr(torch,"compile"):
-        try:
-            base = torch.compile(
-                base,
-                mode=tr.get("compile_mode","reduce-overhead"),
-                fullgraph=False,
-                dynamic=True
-            )
-            compiled_used = True
-            print("✅ torch.compile enabled.")
-        except Exception as e:
-            print(f"⚠️ torch.compile skipped: {e}")
-            compiled_used = False
+    # Finetune: load checkpoint (partial OK if graph/head changed)
+    if bool(ft_cfg.get("enabled", False)):
+        ckpt_path = ft_cfg.get("load_from", "")
+        if ckpt_path and os.path.exists(ckpt_path):
+            sd = torch.load(ckpt_path, map_location="cpu")
+            missing, unexpected = base.load_state_dict(sd, strict=False)
+            print(f"ℹ️ Loaded '{ckpt_path}' (strict=False). Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+        else:
+            print("⚠️  finetune.enabled is True but load_from not found. Proceeding without preload.")
 
     if torch.cuda.device_count()>1:
         print("ℹ️ Using DataParallel. (No change to training math.)")
         net = torch.nn.DataParallel(base)
+        net_for_ema = net.module
     else:
         net = base
+        net_for_ema = net
 
-    # ── static validation loader ─────────────────────────────────────────────
-    test_ds  = RadioMLDataset(C["data"]["processed_dir"],"test",
-        augment=False, seg_cfg=C["segmentation"], aug_cfg=C["augmentation"],
-        min_snr_db=None, max_snr_db=None)
-    tr = C["training"]  # refresh ref
-    dl_va=DataLoader(test_ds,
-        batch_size=tr["test_batch_size"],shuffle=False,
-        pin_memory=True,num_workers=max(0, tr["num_workers"]//2),
+    # EMA for finetune (optional)
+    ema = None
+    if bool(ft_cfg.get("enabled", False)) and float(ft_cfg.get("ema_decay", 0)) > 0:
+        ema = EMA(net_for_ema, decay=float(ft_cfg["ema_decay"]))
+
+    # ── validation loader (shuffle optional to reduce partial-eval bias) ─────
+    val_shuffle = bool(tr.get("shuffle_val", False))
+    if val_shuffle:
+        val_sampler = RandomSampler(test_ds)
+        val_shuffle_flag = False
+    else:
+        val_sampler = SequentialSampler(test_ds)
+        val_shuffle_flag = False
+
+    dl_va = DataLoader(
+        test_ds,
+        batch_size=tr["test_batch_size"],
+        shuffle=val_shuffle_flag,
+        sampler=val_sampler,
+        pin_memory=True,
+        num_workers=max(0, tr["num_workers"] // 2),
         persistent_workers=tr["persistent_workers"],
-        prefetch_factor=max(2, tr["prefetch_factor"]//2))
+        prefetch_factor=max(2, tr["prefetch_factor"] // 2),
+    )
 
     # writers
-    csv_path=Path(tr["save_dir"])/"epoch_metrics.csv"
+    csv_name = "epoch_metrics_finetune.csv" if bool(ft_cfg.get("enabled", False)) else "epoch_metrics.csv"
+    csv_path=Path(tr["save_dir"])/csv_name
     csv_f=open(csv_path,"w",newline="")
     csv_w=None
-    jsonl_path=Path(tr["save_dir"])/"epoch_metrics.jsonl"
+    jsonl_path=Path(tr["save_dir"])/csv_name.replace(".csv",".jsonl")
 
     # bins
     edges=[-20,-10,0,10,20,30]
@@ -549,7 +621,7 @@ def main():
 
     def make_prefetch(loader):
         return CUDAPrefetcher(loader, device, use_channels_last=tr.get("channels_last", True)) \
-               if device.type=="cuda" else iter(loader)
+            if device.type=="cuda" else iter(loader)
 
     num_classes = int(C["model"]["num_classes"])
 
@@ -567,13 +639,81 @@ def main():
     except Exception as e:
         raise RuntimeError(f"Dataset label preflight failed: {e}")
 
-    # curriculum-aware train loader builder
+    # curriculum-aware / finetune-aware train loader builder
     cur_cfg = C.get("curriculum", {"enabled": False})
+    seg_cfg = C["segmentation"]
 
     def _clamp01(x: float) -> float:
         return max(0.0, min(1.0, x))
 
     def build_train_loader_for_epoch(ep: int):
+        # ── Finetune path: now supports min+max SNR and optional class balance ──
+        if bool(ft_cfg.get("enabled", False)):
+            min_snr = float(ft_cfg.get("min_snr_db", 0.0))
+            max_snr = ft_cfg.get("max_snr_db", None)
+            max_snr = float(max_snr) if max_snr is not None else None
+
+            ds = RadioMLDataset(
+                C["data"]["processed_dir"], "train",
+                augment=True, seg_cfg=seg_cfg, aug_cfg=C["augmentation"],
+                min_snr_db=min_snr, max_snr_db=max_snr
+            )
+            note = f"FT SNR≥{min_snr:.1f}dB" + (f" & ≤{max_snr:.1f}dB" if max_snr is not None else "")
+
+            if len(ds) == 0:
+                print("⚠️ Finetune filter produced empty dataset; falling back to all SNRs.")
+                ds = RadioMLDataset(
+                    C["data"]["processed_dir"], "train",
+                    augment=True, seg_cfg=seg_cfg, aug_cfg=C["augmentation"],
+                    min_snr_db=None, max_snr_db=None
+                )
+                note += " → fallback(all)"
+
+            # Optional: class-balanced sampling within the filtered SNR slice
+            if bool(ft_cfg.get("class_balance", False)) and len(ds) > 0:
+                # label histogram
+                tmp_loader = DataLoader(ds, batch_size=8192, shuffle=False, num_workers=0)
+                counts = torch.zeros(num_classes, dtype=torch.long)
+                for b in tmp_loader:
+                    yb = b["y"]
+                    counts.index_add_(0, yb, torch.ones_like(yb, dtype=torch.long))
+
+                # inverse-frequency weights
+                inv = 1.0 / counts.clamp_min(1).float()
+                sample_weights_parts = []
+                tmp_loader = DataLoader(ds, batch_size=8192, shuffle=False, num_workers=0)
+                for b in tmp_loader:
+                    sample_weights_parts.append(inv[b["y"]].clone())
+                sample_weights = torch.cat(sample_weights_parts)
+
+                # choose epoch sample count
+                num_samples = int(tr["max_samples_per_epoch"]) if int(tr["max_samples_per_epoch"]) > 0 else int(sample_weights.numel())
+                sampler = WeightedRandomSampler(sample_weights, num_samples=num_samples, replacement=True)
+
+                dl = DataLoader(
+                    ds, batch_size=tr["batch_size"], sampler=sampler, drop_last=True,
+                    pin_memory=True, num_workers=tr["num_workers"],
+                    persistent_workers=tr["persistent_workers"],
+                    prefetch_factor=tr["prefetch_factor"],
+                )
+                note += " · class-balance"
+                return ds, dl, note
+
+            # default (no class-balance)
+            sampler = None
+            if tr["max_samples_per_epoch"] > 0:
+                sampler = RandomSampler(ds, replacement=True, num_samples=tr["max_samples_per_epoch"])
+            dl = DataLoader(
+                ds,
+                batch_size=tr["batch_size"],
+                shuffle=(sampler is None), sampler=sampler, drop_last=True,
+                pin_memory=True, num_workers=tr["num_workers"],
+                persistent_workers=tr["persistent_workers"],
+                prefetch_factor=tr["prefetch_factor"],
+            )
+            return ds, dl, note
+
+        # ── base training (unchanged) ────────────────────────────────────────
         if cur_cfg.get("enabled", False):
             start = float(cur_cfg.get("start_snr_db", -20.0))
             end   = float(cur_cfg.get("end_snr_db",   10.0))
@@ -581,39 +721,27 @@ def main():
             prog  = _clamp01((ep-1)/(pace-1)) if pace > 1 else 1.0
             curr_low = start + prog * (end - start)
             ds = RadioMLDataset(C["data"]["processed_dir"],"train",
-                augment=True, seg_cfg=C["segmentation"], aug_cfg=C["augmentation"],
-                min_snr_db=curr_low, max_snr_db=None)
+                                augment=True, seg_cfg=seg_cfg, aug_cfg=C["augmentation"],
+                                min_snr_db=curr_low, max_snr_db=None)
             note = f"SNR≥{curr_low:.1f}dB"
         else:
             ds = RadioMLDataset(C["data"]["processed_dir"],"train",
-                augment=True, seg_cfg=C["segmentation"], aug_cfg=C["augmentation"],
-                min_snr_db=None, max_snr_db=None)
+                                augment=True, seg_cfg=seg_cfg, aug_cfg=C["augmentation"],
+                                min_snr_db=None, max_snr_db=None)
             note = "no-curriculum"
 
         if len(ds) == 0:
-            note += " → fallback(all SNRs)"
-            ds = RadioMLDataset(C["data"]["processed_dir"],"train",
-                augment=True, seg_cfg=C["segmentation"], aug_cfg=C["augmentation"],
-                min_snr_db=None, max_snr_db=None)
-
-        if len(ds) == 0:
             print("⚠️  Train dataset is empty even after fallback. Skipping this epoch.")
-            dl = DataLoader(
-                ds,
-                batch_size=tr["batch_size"],
-                shuffle=False,
-                sampler=SequentialSampler(ds),
-                drop_last=False,
-                pin_memory=True, num_workers=0
-            )
+            dl = DataLoader(ds, batch_size=tr["batch_size"], shuffle=False,
+                            sampler=SequentialSampler(ds), drop_last=False,
+                            pin_memory=True, num_workers=0)
             return ds, dl, note + " (empty)"
 
         sampler = None
         if tr["max_samples_per_epoch"] > 0:
             sampler = RandomSampler(ds, replacement=True, num_samples=tr["max_samples_per_epoch"])
         dl = DataLoader(
-            ds,
-            batch_size=tr["batch_size"],
+            ds, batch_size=tr["batch_size"],
             shuffle=(sampler is None), sampler=sampler, drop_last=True,
             pin_memory=True, num_workers=tr["num_workers"],
             persistent_workers=tr["persistent_workers"],
@@ -623,14 +751,20 @@ def main():
 
     opt=sched=per_batch=None
     scaler=GradScaler()
-    best_full=0.0
+    best_full = 0.0
+    best_10_30 = 0.0  # track best high-SNR slice
+    ckpt_name = "best_finetune.pth" if bool(ft_cfg.get("enabled", False)) else "best.pth"
+
+    # F1 control toggles
+    skip_zero = bool(tr.get("f1_skip_zero_support", True))
+    report_w  = bool(tr.get("f1_report_weighted", True))
 
     for ep in range(1,tr["epochs"]+1):
         train_ds, dl_tr, cur_note = build_train_loader_for_epoch(ep)
         print(f"📚 epoch {ep:02d} curriculum: {cur_note} · train_samples={len(train_ds)}")
 
         if opt is None or sched is None:
-            opt, sched, per_batch = build_optim_and_sched(net, tr, len(dl_tr), device)
+            opt, sched, per_batch = build_optim_and_sched(net, tr, len(dl_tr))
 
         # ── train ─────────────────────────────────────────────────────────────
         net.train()
@@ -642,23 +776,9 @@ def main():
                 for k in ("tm","spec","cwt","snr","y"):
                     if isinstance(batch[k], torch.Tensor):
                         batch[k] = batch[k].to(device, non_blocking=True)
-            try:
-                loss_b, corr_b, seen_b, used_micro = train_step_with_microbatch(
-                    net, batch, tr, device, opt, scaler, num_classes, sched=sched, per_batch=per_batch
-                )
-            except CompilePoolError:
-                # robust fallback: rebuild a fresh eager model from state_dict
-                print("⚠️  TorchInductor cudagraph/capture error detected. Falling back to eager model…")
-                net = _rebuild_eager_model_from(net, C, device, channels_last=tr.get("channels_last", True))
-                # disable compile for the rest of the run
-                tr["use_compile"] = False
-                opt, sched, per_batch = build_optim_and_sched(net, tr, len(dl_tr), device)
-                scaler = GradScaler()
-                # retry once on eager
-                loss_b, corr_b, seen_b, used_micro = train_step_with_microbatch(
-                    net, batch, tr, device, opt, scaler, num_classes, sched=sched, per_batch=per_batch
-                )
-
+            loss_b, corr_b, seen_b, used_micro = train_step_with_microbatch(
+                net, batch, tr, device, opt, scaler, num_classes, ema=ema, sched=sched, per_batch=per_batch
+            )
             tot_loss+=loss_b*seen_b; tot_samples+=seen_b; correct += corr_b
             if used_micro and used_micro > 0:
                 pbar.set_postfix(micro_bs=used_micro)
@@ -670,7 +790,7 @@ def main():
         train_acc =100*correct/max(1,tot_samples)
         print(f"epoch {ep:02d} ➜ loss {train_loss:.4f} · train acc {train_acc:.2f}%")
 
-        # ── validate ─────────────────────────────────────────────────────────
+        # ── validate (supports TTA + EMA shadow) ─────────────────────────────
         net.eval()
         masked_corr=masked_tot=0
         hi_corr=hi_tot=0
@@ -680,16 +800,23 @@ def main():
         conf_all=np.zeros((Cn,Cn),dtype=int)
         conf_bins={b:np.zeros((Cn,Cn),dtype=int) for b in bins}
 
+        # swap in EMA weights for eval if present
+        backup=None
+        if ema is not None:
+            backup = ema.apply_shadow(net_for_ema)
+
         prefetch_val = make_prefetch(dl_va)
         max_val_batches = tr["val_max_batches"] if tr["val_max_batches"]>0 else len(dl_va)
         bcount = 0
+        tta_n = int(ft_cfg.get("tta_shifts", 1)) if bool(ft_cfg.get("enabled", False)) else 1
+
         for batch in _tqdm(prefetch_val, total=max_val_batches, desc=f"val   {ep:02d}", leave=False, position=1):
             if device.type != "cuda":
                 for k in ("tm","spec","cwt","snr","y"):
                     if isinstance(batch[k], torch.Tensor):
                         batch[k] = batch[k].to(device, non_blocking=True)
 
-            logits = val_step_with_microbatch(net, batch, tr, num_classes)
+            logits = val_step_with_tta(net, batch, tr, num_classes, seg_cfg, tta_n)
             preds  = logits.argmax(1)
             y      = batch["y"]; snr = batch["snr"]
 
@@ -710,30 +837,59 @@ def main():
             bcount += 1
             if bcount >= max_val_batches: break
 
+        # restore non-EMA weights
+        if ema is not None:
+            ema.restore(net_for_ema, backup)
+
         masked_val_acc = 100.0 * masked_corr / max(1, masked_tot)
         val_acc_10_30  = 100.0 * hi_corr     / max(1, hi_tot)
 
         topk = {k: 100.*v/total_count[0] for k,v in topk_counts.items()}
-        class_f1_all = compute_f1_from_conf(conf_all)
-        macro_f1_all = float(np.mean(class_f1_all))
-        bin_f1 = {b: float(np.mean(compute_f1_from_conf(conf_bins[b]))) for b in bins}
-        bin_acc= {b: 100.*conf_bins[b].trace()/conf_bins[b].sum() if conf_bins[b].sum()>0 else 0.0 for b in bins}
 
+        # NEW: clean macro/weighted F1 overall
+        class_f1_all, supports_all, macro_f1_clean, weighted_f1_all = macro_and_weighted_f1(
+            conf_all, skip_zero_support=skip_zero
+        )
+        macro_f1_strict = float(np.mean(class_f1_all))  # strict (zeros included)
+
+        # per-bin F1 stats
+        bin_macro_f1_clean = {}
+        bin_macro_f1_strict = {}
+        bin_weighted_f1 = {}
+        bin_acc= {}
+        for b in bins:
+            f1_b, supp_b, macro_clean_b, weighted_b = macro_and_weighted_f1(conf_bins[b], skip_zero_support=skip_zero)
+            bin_macro_f1_clean[b]  = macro_clean_b
+            bin_macro_f1_strict[b] = float(np.mean(f1_b))
+            bin_weighted_f1[b]     = weighted_b
+            bin_acc[b] = 100.*conf_bins[b].trace()/conf_bins[b].sum() if conf_bins[b].sum()>0 else 0.0
+
+        # CSV header on first epoch
         if csv_w is None:
             cols = [
                 "epoch","train_loss","train_acc","masked_val_acc","val_acc_10_30",
-                "top1","top3","top5","macro_f1"
+                "top1","top3","top5",
+                "macro_f1",            # clean (skip-zero if enabled)
+                "macro_f1_strict",     # strict (zeros included)
             ]
+            if report_w:
+                cols += ["weighted_f1"]
+
             for i in range(Cn):
                 cols.append(f"class_{i}_f1")
+
             for b in bins:
                 cols.append(f"snr_{b}_acc")
-                cols.append(f"snr_{b}_macro_f1")
-            csv_w=csv.DictWriter(csv_f,fieldnames=cols)
-            csv_w.writeheader()
+                cols.append(f"snr_{b}_macro_f1")         # strict (back-compat)
+                cols.append(f"snr_{b}_macro_f1_clean")   # clean (new)
+                if report_w:
+                    cols.append(f"snr_{b}_weighted_f1")
+
+            csv_w=csv.DictWriter(csv_f,fieldnames=cols); csv_w.writeheader()
 
         print(f"val {ep:02d} ➜ acc[10–30 dB] {val_acc_10_30:.2f}%")
 
+        # row
         flat={
             "epoch":ep,
             "train_loss":train_loss,
@@ -741,26 +897,46 @@ def main():
             "masked_val_acc":masked_val_acc,
             "val_acc_10_30":val_acc_10_30,
             **topk,
-            "macro_f1":macro_f1_all
+            "macro_f1":macro_f1_clean,
+            "macro_f1_strict":macro_f1_strict
         }
+        if report_w:
+            flat["weighted_f1"] = weighted_f1_all
+
         for i,f1 in enumerate(class_f1_all):
             flat[f"class_{i}_f1"]=f1
         for b in bins:
             flat[f"snr_{b}_acc"]=bin_acc[b]
-            flat[f"snr_{b}_macro_f1"]=bin_f1[b]
+            flat[f"snr_{b}_macro_f1"]=bin_macro_f1_strict[b]
+            flat[f"snr_{b}_macro_f1_clean"]=bin_macro_f1_clean[b]
+            if report_w:
+                flat[f"snr_{b}_weighted_f1"]=bin_weighted_f1[b]
 
         csv_w.writerow(flat); csv_f.flush()
         with open(jsonl_path,"a") as jf: jf.write(json.dumps({
-            **flat, "class_f1": class_f1_all, "snr_bin_acc": bin_acc, "snr_bin_macro_f1": bin_f1
+            **flat,
+            "class_f1": class_f1_all,
+            "class_supports": supports_all
         })+"\n")
 
-        if topk["top1"]>best_full:
-            best_full=topk["top1"]
-            torch.save(net.state_dict(),os.path.join(tr["save_dir"],"best.pth"))
-            print(f"🏅 new best model (top1={best_full:.2f}%)")
+        # ── checkpointing ────────────────────────────────────────────────────
+        # save LAST every epoch (unwrapped module to avoid "module." keys)
+        torch.save(net_for_ema.state_dict(), os.path.join(tr["save_dir"], "last.pth"))
+
+        # best on overall top-1 (as before)
+        if topk["top1"] > best_full:
+            best_full = topk["top1"]
+            torch.save(net_for_ema.state_dict(), os.path.join(tr["save_dir"], ckpt_name))
+            print(f"🏅 new best model (top1={best_full:.2f}%) → saved to {ckpt_name}")
+
+        # best on the high-SNR slice 10–30 dB
+        if val_acc_10_30 > best_10_30:
+            best_10_30 = val_acc_10_30
+            torch.save(net_for_ema.state_dict(), os.path.join(tr["save_dir"], "best_10_30.pth"))
+            print(f"🏆 new best high-SNR model (10–30 dB={best_10_30:.2f}%) → saved to best_10_30.pth")
 
     csv_f.close()
-    print(f"\n✅ done — best top1 = {best_full:.2f}%")
+    print(f"\n✅ done — best top1 = {best_full:.2f}% · best 10–30 dB = {best_10_30:.2f}%")
 
 if __name__=="__main__":
     main()

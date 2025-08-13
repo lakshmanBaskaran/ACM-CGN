@@ -241,7 +241,8 @@ class MultiBranchGNNClassifier(nn.Module):
         heads     = int(mdl["gnn_heads"])
         drop      = float(mdl.get("dropout", 0.1))
         self.impl = mdl.get("gnn_impl", "gatv2").lower()          # "gatv2" | "transformer"
-        self.graph_mode = mdl.get("graph_connectivity", "full")   # "full" | "chain"
+        # default to "chain" for stability (matches write-up)
+        self.graph_mode = mdl.get("graph_connectivity", "chain")  # "full" | "chain"
 
         # config: denoiser selection & seg-transformer
         denoiser_type = (mdl.get("denoiser_type", "1d") or "1d").lower()
@@ -258,8 +259,13 @@ class MultiBranchGNNClassifier(nn.Module):
                 drop_path=float(segtf_cfg.get("drop_path", 0.05)),
             )
 
-        # denoiser autoencoder (weights copied from AE pretrain in train.py)
+        # AE denoise toggle (weights loaded in train.py if pre-trained)
+        self.use_autoenc = bool(mdl.get("use_autoenc_denoise", False))
         self.autoenc = DenoiserAutoEnc(in_ch=4, hidden=32)
+        if self.use_autoenc:
+            for p in self.autoenc.parameters():
+                p.requires_grad = False
+            self.autoenc.eval()
 
         # shared encoders
         self.time_enc = TimeSegEncoder(
@@ -273,7 +279,7 @@ class MultiBranchGNNClassifier(nn.Module):
         self.qam_adapt = ExpertAdapter(feat_d, drop=drop * 0.6, drop_path=0.07)
         self.fsk_adapt = ExpertAdapter(feat_d, drop=drop * 0.4, drop_path=0.09)
 
-        # gate: mean of experts + raw snr
+        # gate: mean of experts + scaled snr
         self.gate = nn.Sequential(
             nn.Linear(3 * feat_d + 1, 128), nn.ReLU(),
             nn.Linear(128, 3)
@@ -299,8 +305,8 @@ class MultiBranchGNNClassifier(nn.Module):
             self.norms.append(nn.LayerNorm(H))
         self.final_dim = H
 
-        # pooling (SAG)
-        self.pool = SAGPooling(self.final_dim, ratio=float(mdl.get("sag_pool_ratio", 0.5)))
+        # pooling (SAG) – default ratio 0.4 (safer)
+        self.pool = SAGPooling(self.final_dim, ratio=float(mdl.get("sag_pool_ratio", 0.4)))
 
         # precompute base edges per graph
         base = self._make_base_edge_index(self.S, self.graph_mode)   # (2, E)
@@ -341,64 +347,72 @@ class MultiBranchGNNClassifier(nn.Module):
         if T < full:
             pad = x.new_zeros(B, full - T, C)
             x   = torch.cat([x, pad], dim=1)
-        return x.unfold(1, self.L, self.step).reshape(B * self.S, self.L, C)
+        win = x.unfold(1, self.L, self.step)  # (B, S_actual, L, C)
+        S_actual = win.size(1)
+        if S_actual != self.S:
+            if S_actual > self.S:
+                win = win[:, :self.S]
+            else:
+                pad_win = x.new_zeros(B, self.S - S_actual, self.L, C)
+                win = torch.cat([win, pad_win], dim=1)
+        return win.reshape(B * self.S, self.L, C)
 
     # ── PyG block kept eager for stability under torch.compile ───────────────
     @torch._dynamo.disable
-    def _pyg_block(self, x, edge_index, batch_vec):
+    def _pyg_block(self, x, edge_index, batch_vec, B: int):
         # 5) GNN stack (residual + LN; dropout inside convs)
         for conv, ln in zip(self.gnns, self.norms):
             h = conv(x, edge_index)
             x = ln(F.gelu(h)) + x
         # 6) Pool with SAG, then global mean per graph
         x_p, edge_p, _, batch_out, _, _ = self.pool(x, edge_index, batch=batch_vec)
-        # batch size = last label + 1 (labels are 0..B-1)
-        B = int(batch_out[-1].item()) + 1 if batch_out.numel() > 0 else 0
         g = global_mean_pool(x_p, batch_out, size=B)  # (B,H)
         return g
 
     # ── forward ──────────────────────────────────────────────────────────────
     def forward(self, tm, spec, cwt, snr_db, return_embed: bool = False):
-        # 1) denoise (AE) + segment + encode per segment
-        tm = self.autoenc(tm)                           # (B,T,4)  residual-denoised
+        # 1) optional AE denoise (residual) + segment + encode per segment
+        if self.use_autoenc:
+            with torch.no_grad():
+                tm = self.autoenc(tm)                       # (B,T,4)
         B  = tm.size(0)
-        tm_seg = self._segment(tm)                      # (B*S, L, 4)
-        seg_feat = self.time_enc(tm_seg, self.S)        # (B,S,D)
+        tm_seg  = self._segment(tm)                         # (B*S, L, 4)
+        seg_feat = self.time_enc(tm_seg, self.S)            # (B,S,D)
 
         # 2) add global spec + cwt encodings
-        spec_vec = self.spec_enc(spec)                  # (B,D)
+        spec_vec = self.spec_enc(spec)                      # (B,D)
         seg_feat = seg_feat + spec_vec.unsqueeze(1)
-        cwt_vec  = self.cwt_enc(cwt)                    # (B,D) or None
+        cwt_vec  = self.cwt_enc(cwt)                        # (B,D) or None
         if isinstance(cwt_vec, torch.Tensor):
             seg_feat = seg_feat + cwt_vec.unsqueeze(1)
 
-        # 3) expert adapters + gating
+        # 3) expert adapters + gating (scale SNR for stability)
         f1 = self.psk_adapt(seg_feat)
         f2 = self.qam_adapt(seg_feat)
         f3 = self.fsk_adapt(seg_feat)
         g1 = f1.mean(dim=1); g2 = f2.mean(dim=1); g3 = f3.mean(dim=1)
-        snr_in = snr_db.to(g1.dtype).unsqueeze(1)
-        w = F.softmax(self.gate(torch.cat([g1, g2, g3, snr_in], dim=1)), dim=1)  # (B,3)
-        w = w.unsqueeze(1).unsqueeze(-1)                                         # (B,1,3,1)
-        x = (torch.stack([f1, f2, f3], dim=2) * w).sum(dim=2)                    # (B,S,D)
+        snr_scaled = (snr_db / 30.0).to(g1.dtype).unsqueeze(1)
+        w = F.softmax(self.gate(torch.cat([g1, g2, g3, snr_scaled], dim=1)), dim=1)  # (B,3)
+        w = w.unsqueeze(1).unsqueeze(-1)                                             # (B,1,3,1)
+        x = (torch.stack([f1, f2, f3], dim=2) * w).sum(dim=2)                        # (B,S,D)
 
         # 4) add positional + SNR embeddings (let seg-transformer see them)
         pos_emb = self.pos(self.pos_idx.to(tm.device)).unsqueeze(0).expand(B, -1, -1)
-        snr_emb = self.snr_emb(snr_db.unsqueeze(1)).unsqueeze(1).expand(B, self.S, -1)
-        x = x + pos_emb + snr_emb                                               # (B,S,D)
+        snr_emb = self.snr_emb(snr_scaled).unsqueeze(1).expand(B, self.S, -1)
+        x = x + pos_emb + snr_emb                                                   # (B,S,D)
 
         # 4b) optional transformer across segments
         if self.use_seg_tf and (self.seg_tf is not None):
-            x = self.seg_tf(x)                                                  # (B,S,D)
+            x = self.seg_tf(x)                                                      # (B,S,D)
 
         # 5) project & flatten to a batched graph
-        x = self.in_proj(x)                                                     # (B,S,H)
-        x = x.reshape(B * self.S, -1)                                           # (B*S,H)
-        edge_index = self._edge_index(B, x.device)                              # (2, E_total)
-        batch_vec  = torch.arange(B, device=x.device).repeat_interleave(self.S) # (B*S,)
+        x = self.in_proj(x)                                                         # (B,S,H)
+        x = x.reshape(B * self.S, -1)                                               # (B*S,H)
+        edge_index = self._edge_index(B, x.device)                                  # (2, E_total)
+        batch_vec  = torch.arange(B, device=x.device).repeat_interleave(self.S)     # (B*S,)
 
         # 6) PyG GNN + pooling (kept eager)
-        g = self._pyg_block(x, edge_index, batch_vec)                           # (B,H)
+        g = self._pyg_block(x, edge_index, batch_vec, B)                            # (B,H)
 
         # 7) classify
         logits = self.head(g)
